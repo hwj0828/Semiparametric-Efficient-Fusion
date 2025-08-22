@@ -4,7 +4,6 @@ setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 rm(list = ls())
 library(sigmoid)
 library(MASS)
-library(randomForest)
 
 esti.INT <- function(rct){
   n0 <- nrow(rct)
@@ -13,19 +12,14 @@ esti.INT <- function(rct){
   rct_treated <- rct[(rct$X==1), -1]
   rct_control <- rct[(rct$X==0), -1]
   
-  # Use Random Forest for propensity score estimation
-  propensity_model <- randomForest(X ~ ., data = rct[, -2], ntree = 500)
-  propensity <- predict(propensity_model, newdata = rct[, -2], type = "prob")[,2]
+  propensity_model <- glm(X~., family = 'binomial', data = rct[, -2]) # glm(X~age+height+Weight+BMI+Marriage+Education+Gender+Job, family = "binomial", data = rct)
+  propensity <- propensity_model$fitted.values
   
-  # Use Random Forest for outcome modeling
-  reg1 <- randomForest(Outcome ~ ., data = rct_treated, ntree = 500)
-  reg0 <- randomForest(Outcome ~ ., data = rct_control, ntree = 500)
+  reg1 <- glm(Outcome~., family = 'binomial', data = rct_treated)  # glm(Outcome~age+height+Weight+BMI+Marriage+Education+Gender+Job, family = "binomial", data = rct_treated)
+  reg0 <- glm(Outcome~., family = 'binomial', data = rct_control)  # glm(Outcome~age+height+Weight+BMI+Marriage+Education+Gender+Job, family = "binomial", data = rct_control)
+  m1 <- predict(reg1, newdata = rct[, -c(1,2)], type = "response") # predict(reg1, newdata = rct[,c('age', 'height', 'Weight', 'BMI', 'Marriage', 'Education', 'Gender', 'Job')], type = "response")
+  m0 <- predict(reg0, newdata = rct[, -c(1,2)], type = "response") # predict(reg0, newdata = rct[,c('age', 'height', 'Weight', 'BMI', 'Marriage', 'Education', 'Gender', 'Job')], type = "response")
   
-  # Get predictions
-  m1 <- predict(reg1, newdata = rct[, -c(1,2)])
-  m0 <- predict(reg0, newdata = rct[, -c(1,2)])
-  
-  # Calculate causal effect estimates
   hattau_1 <- mean(rct$X*(rct$Outcome - m1)/propensity + m1)
   hattau_0 <- mean((1 - rct$X)*(rct$Outcome - m0)/(1 - propensity) + m0)
   phi <- (rct$X*(rct$Outcome - m1)/propensity + m1) - 
@@ -104,6 +98,28 @@ crossvalidation <- function(dat,tildabeta,sigma,kfold,n0,n1){
   C.optimal <- C.list[which.min(cv.error)]
 }
 
+boot.ADF.pval <- function(hattau1, b_try, S00, S01, S11, n0, n1, C, NB = 500){
+  rho <- n1/n0
+  
+  Boot <- matrix(NA, length(hattau1), NB)
+  
+  for (j in 1:NB) {
+    sumdata_tmp <- mvrnorm(1, c(hattau1, b_try), rbind(cbind(S00, - S01), 
+                                                       cbind(t(- S01), S11)))
+    tau_tmp <- sumdata_tmp[1:length(hattau1)]
+    b_tmp <- sumdata_tmp[- (1:length(hattau1))]
+    
+    wb <- pmax(1 - C * b_tmp^4 * sqrt(n0), 0)
+    
+    hattau <- tau_tmp + S01 %*% wb %*% ginv(sqrt(wb) %*% S11 %*% sqrt(wb) + (1 - wb) * S11)%*%
+      b_tmp
+    
+    Boot[, j] <- hattau - hattau1
+  }
+  
+  mean(hattau1 < Boot)
+}
+
 
 obs_control <- read.csv("./HP_OBS_control.csv")
 rct_treated <- read.csv("./HP_RCT_treated.csv")
@@ -168,3 +184,27 @@ result_ADF <- esti.ADF(rct,tildatau_0,sigma, n1,C)
 htau_ADF <- result_ADF[1]
 pvalue_ADF <- 1 - pnorm(htau_ADF/result_ADF[2])
 
+##bootstrapped ADF
+set.seed(0)
+KS <- 10
+pval_boot <- c()
+b_est <- tildatau_0 - hattau_0
+
+hattau_1 - hattau_0 - mean(phi*eta)/(sigma/rho + var(eta))*(hattau_0 - tildatau_0)
+S00 <- var(phi) / n0 
+S11 <- (sigma/rho + var(eta)) / n0
+S01 <- mean(phi*eta)/n0
+
+p_h <- as.numeric(1 - pchisq(b_est^2 / S11, 1))
+
+b_pos <- b_est
+S_pos <- S11
+S_pos <- S_pos
+for (k in 1:KS) {
+  b_try <- mvrnorm(1, b_pos, S_pos)
+  b_try <- (p_h > 0.05 / log(n0)) * sqrt(pmax(b_pos^2 - S11, 0) / (b_pos^2 + S11)) * b_try + 
+    (p_h <= 0.05 / log(n0)) * b_pos
+  pval_boot[k] <- boot.ADF.pval(htau_ADF, b_try, S00, S01, S11, n0, n1, C, NB = 500)
+}
+
+max(pval_boot)
