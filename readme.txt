@@ -1,3 +1,5 @@
+This repository contains the code for replication of the results in the paper "Semiparametric Efficient Fusion of Individual Data and Summary Statistics" by Wenjie Hu, Ruoyu Wang, Wei Li and Wang Miao. 
+
 "sim1.R" contains the code to conduct the simulation under Scenario I. The parameter n1 in the code is the external sample size m in the maintext.
 
 "sim2.R" contains the code to conduct the simulation under Scenario II with biased summary statistics.
@@ -13,4 +15,5 @@
 "HP Data" contains the data and the analysis code for the HP data analysis.
 
 "heterogeneous.R" contains the code to conduct the simulation with heteroscedastic error in supplementary material (Figure S1 and Table S1).
+
 
