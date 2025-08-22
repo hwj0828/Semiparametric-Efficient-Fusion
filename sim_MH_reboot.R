@@ -1,0 +1,516 @@
+# Jun 24, 2023
+# Simulation for Scenario II with square root n order bias
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+rm(list = ls())
+
+library(parallel)
+library(boot)
+library(MASS)
+library(gim)
+library(expm)
+library(glmnet)
+
+# parallel replicate
+# refer to https://rdrr.io/github/grayclhn/dbframe-R-library/man/RepParallel.html
+# parallel replicate
+
+source("./mclapply.hack.R")
+
+parReplicate <- function(n, expr, simplify = "array",...) {
+  answer <-
+    mclapply(integer(n), eval.parent(substitute(function(...) expr)),...)
+  if (!identical(simplify, FALSE) && length(answer)) 
+    return(simplify2array(answer, higher = (simplify == "array")))
+  else return(answer)
+}
+
+
+esti.INT <- function(x,y){
+  n0 <- length(y)
+  result <- lm(y~x)
+  design <- cbind(rep(1,n0), x)
+  hattau1 <- result$coef[-1]   ## use only internal data
+  # variance <- diag(solve(t(design)%*%design)%*%t(design)%*%
+  #         diag(result$residual)^2%*%design%*%solve(t(design)%*%design))
+  variance <- (mean(result$residual^2)*diag(solve(t(design)%*%design)))[-1]
+  stderror <- sqrt(variance)
+  c(hattau1, stderror)
+}
+
+esti.ORC <- function(x,y, tildabeta, V,n1){
+  n0 <- length(y)
+  n <- n0+n1
+  rho <- n1/n0
+  result <- lm(y~x)
+  hattau1 <- result$coef[-1]
+  
+  tildabeta1 <- tildabeta[1]
+  tildabeta2 <- tildabeta[2]
+  reg1 <- lm(y~x[,1])
+  hbeta1 <- reg1$coef[2]
+  varX <- t(x)%*%x/n0
+  phi <- (x*result$residuals)%*%solve(varX)
+  eta1 <- x[,1]*reg1$residuals/varX[1,1]
+  
+  tmp <- mean(eta1^2)  ##Eeta1^2
+  sigma2 <- mean(result$residuals^2)
+  hattau <- hattau1 - (n1/(n0+n1)/tmp*sigma2*c(1/varX[1,1],0)*(hbeta1 - tildabeta1))
+  variance <- diag(t(phi)%*%phi/n0 - n1/(n0+n1)*(t(phi)%*%eta1)%*%(t(eta1)%*%phi)/tmp/n0^2 )/n0
+  stderror <- sqrt(variance)
+  c(hattau, stderror)
+}
+
+esti.ADF <- function(x,y, tildabeta, V,n1, C){
+  n0 <- length(y)
+  n <- n0+n1
+  rho <- n1/n0
+  result <- lm(y~x)
+  hattau1 <- result$coef[-1]
+  
+  tildabeta1 <- tildabeta[1]
+  tildabeta2 <- tildabeta[2]
+  reg1 <- lm(y~x[,1])
+  hbeta1 <- reg1$coef[2]
+  reg2 <- lm(y~x[,2])
+  hbeta2 <- reg2$coef[2]
+  hbeta <- c(hbeta1, hbeta2)
+  
+  varX <- t(x)%*%x/n0
+  phi <- (x*result$residuals)%*%solve(varX)
+  eta1 <- x[,1]*reg1$residuals/varX[1,1]
+  eta2 <- x[,2]*reg2$residuals/varX[2,2]
+  eta <- cbind(eta1, eta2)
+  
+  S00 <- t(phi)%*%phi/n0^2
+  S01 <- t(phi)%*%eta/n0^2
+  S11 <- (V / rho + t(eta)%*%eta/n0)/n0
+  
+  wb <- pmax(1 - C * (hbeta - tildabeta)^4 * sqrt(n0), 0)
+  
+  hattau <- hattau1 + S01 %*% diag(wb) %*% ginv(diag(sqrt(wb)) %*% S11 %*% diag(sqrt(wb)) + diag((1 - wb) * diag(S11)))%*%
+            (tildabeta - hbeta)
+  
+  variance <- diag(t(phi)%*%phi/n0^{2} - S01 %*% diag(wb) %*% 
+                   ginv(diag(sqrt(wb)) %*% S11 %*% diag(sqrt(wb)) + diag((1 - wb) * diag(S11))) %*% diag(wb) %*%
+                  t(S01))
+  
+  stderror <- sqrt(variance)
+  c(hattau, stderror)
+}
+
+crossvalidation <- function(x,y,tildabeta,V,kfold,n1){
+  n0 <- length(y)
+  C.list <- c(1 / (1:5), 1:5)
+  cv.error <- rep(NA,length(C.list))
+  S <- 10
+  
+  dat <- cbind(y,x)
+  
+  for (j in 1:length(C.list)) {
+    error <- rep(NA, kfold*S)
+    for (s in 1:S) {
+      shuffle.dat <- dat[sample(nrow(dat)),]
+      subset <- cut(seq(1: nrow(dat)), breaks=kfold, labels=FALSE)
+      for (i in 1:kfold) {
+        #Segement your data by 'subset' using the which() function 
+        testIndexes <- which(subset==i,arr.ind=TRUE)
+        testData <- shuffle.dat[testIndexes, ]
+        trainData <- shuffle.dat[-testIndexes, ]
+        #Use the test and train data partitions however you desire...
+        
+        result_ADF <- esti.ADF(x=trainData[,-1], y=trainData[,1], 
+                               tildabeta, V,n1, C.list[j])
+        htau_ADF <- result_ADF[c(1,2)]
+        
+        result_INT <- esti.INT(testData[,-1], testData[,1])
+        test_htau <- result_INT[c(1,2)]
+        error[i+kfold*(s-1)] <- mean((htau_ADF - test_htau)^2)
+      }
+    }
+    cv.error[j] <- mean(error)
+  }
+  C.optimal <- C.list[which.min(cv.error)]
+}
+
+esti.EFF <- function(x,y, tildabeta, V,n1){
+  n0 <- length(y)
+  n <- n0+n1
+  rho <- n1/n0
+  result <- lm(y~x)
+  hattau1 <- result$coef[-1]
+  
+  tildabeta1 <- tildabeta[1]
+  tildabeta2 <- tildabeta[2]
+  reg1 <- lm(y~x[,1])
+  hbeta1 <- reg1$coef[2]
+  reg2 <- lm(y~x[,2])
+  hbeta2 <- reg2$coef[2]
+  varX <- t(x)%*%x/n0
+  phi <- (x*result$residuals)%*%solve(varX)
+  eta1 <- x[,1]*reg1$residuals/varX[1,1]
+  eta2 <- x[,2]*reg2$residuals/varX[2,2]
+  eta <- cbind(eta1, eta2)
+  W <- t(eta)%*%eta/n0
+  
+  hattau <- hattau1 + (t(phi)%*%eta/n0)%*%solve(V/rho + W)%*%(
+    c(tildabeta1 - hbeta1, tildabeta2 - hbeta2))
+  variance <- diag(t(phi)%*%phi/n0 - rho/(1 + rho)*(t(phi)%*%eta)%*%solve(t(eta)%*%eta)%*%(t(eta)%*%phi)/n0 )/n0
+  stderror <- sqrt(variance)
+  c(hattau, stderror)
+}
+
+
+esti.GIM <- function(x,y, tildabeta, V,n1){
+  n0 <- length(y)
+  dat0 <- as.data.frame(cbind(y,x))
+  form1 <- 'y ~ x1'
+  form2 <- 'y ~ x2'
+  model <- list()
+  ## partial information is available
+  model[[1]] <- list(form = form1, 
+                     info = data.frame(var = 'x1', 
+                                       bet = tildabeta[1]))
+  
+  model[[2]] <- list(form = form2, 
+                     info = data.frame(var = 'x2', 
+                                       bet = tildabeta[2]))
+  form <- 'y ~ x1+x2'
+  nsample <- matrix(c(n1, n1, n1, n1),2, 2)
+  skip_to_next <- FALSE
+  tryCatch(fit <- gim(form, 'gaussian', dat0, model, nsample), error = function(e) { skip_to_next <<- TRUE})
+  if(skip_to_next){
+    hattau <- c(NA, NA)
+    variance <- c(NA, NA)
+  } else{
+    hattau <- fit$coef[-1]
+    variance <- diag(fit$vcov)[-1]
+  }
+  stderror <- sqrt(variance)
+  c(hattau, stderror)
+}
+
+boot.ADF <- function(hattau1, b_try, S00, S01, S11, n0, n1, C, NB = 500){
+  rho <- n1/n0
+  
+  Boot <- matrix(NA, length(hattau1), NB)
+  
+  for (j in 1:NB) {
+    sumdata_tmp <- mvrnorm(1, c(hattau1, b_try), rbind(cbind(S00, - S01), 
+                                               cbind(t(- S01), S11)))
+    tau_tmp <- sumdata_tmp[1:length(hattau1)]
+    b_tmp <- sumdata_tmp[- (1:length(hattau1))]
+    
+    wb <- pmax(1 - C * b_tmp^4 * sqrt(n0), 0)
+    
+    hattau <- tau_tmp + S01 %*% diag(wb) %*% ginv(diag(sqrt(wb)) %*% S11 %*% diag(sqrt(wb)) + diag((1 - wb) * diag(S11)))%*%
+              b_tmp
+    
+    Boot[, j] <- hattau - hattau1
+  }
+  
+  c(hattau1 - apply(Boot, 1, function(x) {quantile(x, 0.975)}), hattau1 - apply(Boot, 1, function(x) {quantile(x, 0.025)}))
+}
+
+# infe.ADF <- function(x,y, tildabeta, V,n1, C){
+#   n0 <- length(y)
+#   n <- n0+n1
+#   rho <- n1/n0
+#   result <- lm(y~x)
+#   hattau1 <- result$coef[-1]
+#   
+#   tildabeta1 <- tildabeta[1]
+#   tildabeta2 <- tildabeta[2]
+#   reg1 <- lm(y~x[,1])
+#   hbeta1 <- reg1$coef[2]
+#   reg2 <- lm(y~x[,2])
+#   hbeta2 <- reg2$coef[2]
+#   varX <- t(x)%*%x/n0
+#   phi <- (x*result$residuals)%*%solve(varX)
+#   eta1 <- x[,1]*reg1$residuals/varX[1,1]
+#   eta2 <- x[,2]*reg2$residuals/varX[2,2]
+#   eta <- cbind(eta1, eta2)
+#   W <- t(eta)%*%eta/n0
+#   M <- solve(sqrtm(V/rho + W))
+#   
+#   Sb <- V/rho + W
+#   
+#   KS <- 50
+#   
+#   b <- c(tildabeta1 - hbeta1, tildabeta2 - hbeta2)
+#   
+#   re_b <- mvrnorm(KS, rep(0, 2), (V/rho + W) / n0)
+#   
+#   hattau <- matrix(NA, KS, 2)
+#   variance <- matrix(NA, KS, 2)
+#   
+#   for (k in 1:KS) {
+#     A <- M%*%(c(b + re_b[k, ]))
+#     penalty <- diag(Sb) / abs(b + re_b[k, ])^2
+#     
+#     adalasso <- glmnet(M, A, alpha = 1, intercept = FALSE,lambda = C/(n0)*sum(penalty)/2,
+#                        penalty.factor = penalty)
+#     b_tmp <- as.array(adalasso$beta)
+#     
+#     # hattau <- hattau1 + (t(phi)%*%eta/n0)%*%solve(V/rho + W)%*%(
+#     #   c(tildabeta1 - hbeta1, tildabeta2 - hbeta2) - b)
+#     
+#     if(sum(b_tmp==0)==2){
+#       hattau[k, ] <- hattau1 + (t(phi)%*%eta/n0)%*%solve(V/rho + W)%*%(
+#         b)
+#       variance[k, ] <- diag(t(phi)%*%phi/n0 - rho/(1 + rho)*(t(phi)%*%eta)%*%solve(t(eta)%*%eta)%*%(t(eta)%*%phi)/n0 )/n0
+#     } else if(b_tmp[1]==0 & (b_tmp[2]!=0)){
+#       hattau[k, ] <- hattau1 + (t(phi)%*%eta1/n0)%*%solve(V[1,1]/rho + W[1,1])%*%(
+#         b[1])
+#       variance[k, ] <- diag(t(phi)%*%phi/n0 - rho/(1+rho)*(t(phi)%*%eta1)%*%(t(eta1)%*%phi)/mean(eta1^2)/n0^2 )/n0
+#     } else if(b_tmp[2]==0 & (b_tmp[1]!=0)){
+#       hattau[k, ] <- hattau1 + (t(phi)%*%eta2/n0)%*%solve(V[2,2]/rho + W[2,2])%*%(b[2])
+#       variance[k, ] <- diag(t(phi)%*%phi/n0 - rho/(1+rho)*(t(phi)%*%eta2)%*%(t(eta2)%*%phi)/mean(eta2^2)/n0^2 )/n0
+#     } else{
+#       hattau[k, ] <- hattau1
+#       variance[k, ] <- diag(t(phi)%*%phi/n0)/n0
+#     }
+#     stderror <- sqrt(variance)
+#   }
+#   
+#   cbind(apply(hattau - 1.96 * stderror, 2, min), apply(hattau + 1.96 * stderror, 2, max))
+# }
+
+simuOne <- function(n,n0,n1,kfold, B){
+  tau <- c(1,1)
+  kappa <- 0.6
+  Sigma <- matrix(c(1,kappa, kappa, 1), nrow = 2, byrow = TRUE)
+  rho <- n1/n0
+  
+  x <- mvrnorm(n, mu=c(0,0), Sigma = Sigma)
+  y <- x%*%tau + rnorm(n,sd=2)
+  dat <- as.data.frame(cbind(y,x))
+  colnames(dat) <- c('y', 'x1', 'x2')
+  
+  
+  dat0 <- dat[1:n0, ]
+  dat1 <- dat[(n0+1):(n0+n1), ]
+  dat1$x2 <- dat1$x2 + rnorm(n1, sd = sqrt(B)*n0^{-1/4})
+  
+  x_inter <- as.matrix(dat0[,c(2,3)])
+  y_inter <- dat0$y 
+  
+  x_exter <- as.matrix(dat1[,c(2,3)])
+  y_exter <- dat1$y
+  
+  result <- lm(y_inter~x_inter)
+  hattau1 <- result$coef[-1]
+  varX <- t(x_inter)%*%x_inter/n0
+  phi <- (x_inter*result$residuals)%*%solve(varX)
+  
+  reg1 <- lm(y_inter~x_inter[,1])
+  hbeta1 <- reg1$coef[2]
+  reg2 <- lm(y_inter~x_inter[,2])
+  hbeta2 <- reg2$coef[2]
+  hbeta <- c(hbeta1, hbeta2)
+  eta1 <- x_inter[,1]*reg1$residuals/varX[1,1]
+  eta2 <- x_inter[,2]*reg2$residuals/varX[2,2]
+  eta <- cbind(eta1, eta2)
+  
+  
+  reg1 <- lm(y_exter~x_exter[,1])
+  tildabeta1 <- reg1$coef[2]
+  reg2 <- lm(y_exter~x_exter[,2])
+  tildabeta2 <- reg2$coef[2]
+  tildabeta <- c(tildabeta1, tildabeta2)
+  
+  varX_ext <- t(x_exter)%*%x_exter/n1
+  tildaeta1 <- x_exter[,1]*reg1$residuals/varX_ext[1,1]
+  tildaeta2 <- x_exter[,2]*reg2$residuals/varX_ext[2,2]
+  tildaeta <- cbind(tildaeta1, tildaeta2)
+  V <- t(tildaeta)%*%tildaeta/n1
+  
+  S00 <- t(phi)%*%phi/n0^2
+  S01 <- t(phi)%*%eta/n0^2
+  S11 <- (V / rho + t(eta)%*%eta/n0)/n0
+  
+  ## efficient estimator using only internal data
+  result_INT <- esti.INT(x_inter, y_inter)
+  htau_INT <- result_INT[c(1,2)]
+  stderror_INT <- result_INT[c(3,4)]
+  cv_INT1 <- (tau[1] >= htau_INT[1] - 1.96*stderror_INT[1]) & 
+    (tau[1] <= htau_INT[1] + 1.96*stderror_INT[1])
+  cv_INT2 <- (tau[2] >= htau_INT[2] - 1.96*stderror_INT[2]) & 
+    (tau[2] <= htau_INT[2] + 1.96*stderror_INT[2])
+  cv_INT <- c(cv_INT1, cv_INT2)
+  
+  ## oracle estimator
+  result_ORC <- esti.ORC(x_inter, y_inter,tildabeta, V,n1)
+  htau_ORC <- result_ORC[c(1,2)]
+  stderror_ORC <- result_ORC[c(3,4)]
+  cv_ORC1 <- (tau[1] >= htau_ORC[1] - 1.96*stderror_ORC[1]) & 
+    (tau[1] <= htau_ORC[1] + 1.96*stderror_ORC[1])
+  cv_ORC2 <- (tau[2] >= htau_ORC[2] - 1.96*stderror_ORC[2]) & 
+    (tau[2] <= htau_ORC[2] + 1.96*stderror_ORC[2])
+  cv_ORC <- c(cv_ORC1, cv_ORC2)
+  
+  ## debiased estimator
+  C <- crossvalidation(x_inter,y_inter,tildabeta,V,kfold,n1)
+  result_ADF <- esti.ADF(x_inter, y_inter, tildabeta, V,n1,C)
+  htau_ADF <- result_ADF[c(1,2)]
+  stderror_ADF <- result_ADF[c(3,4)]
+  cv_ADF1 <- (tau[1] >= htau_ADF[1] - 1.96*stderror_ADF[1]) & 
+    (tau[1] <= htau_ORC[1] + 1.96*stderror_ORC[1])
+  cv_ADF2 <- (tau[2] >= htau_ADF[2] - 1.96*stderror_ADF[2]) & 
+    (tau[2] <= htau_ADF[2] + 1.96*stderror_ADF[2])
+  cv_ADF <- c(cv_ADF1, cv_ADF2)
+  
+  
+  ##bootstrapped ADF
+  KS <- 10
+  cri_boot <- matrix(NA, KS, 4)
+  b_est <- tildabeta - hbeta
+  
+  p_h <- as.numeric(1 - pchisq(b_est^2 / diag(S11), 1))
+  
+  b_pos <- b_est
+  S_pos <- S11
+  S_pos <- S_pos
+  for (k in 1:KS) {
+    b_try <- mvrnorm(1, b_pos, S_pos)
+    b_try <- (p_h > 0.05 / log(n0)) * sqrt(pmax(b_pos^2 - diag(S11), 0) / (b_pos^2 + diag(S11))) * b_try + 
+             (p_h <= 0.05 / log(n0)) * b_pos
+    cri_boot[k, ] <- boot.ADF(htau_ADF, b_try, S00, S01, S11, n0, n1, C, NB = 500)
+  }
+  
+  
+  cri_boot <- cbind(apply(cri_boot[, 1:2], 2, min), apply(cri_boot[, 3:4], 2, max))
+  
+  cv_SADF <- tau >= cri_boot[, 1] & tau <= cri_boot[, 2]
+  
+  ## data-fused efficient estimator
+  result_EFF <- esti.EFF(x_inter, y_inter,tildabeta, V,n1)
+  htau_EFF <- result_EFF[c(1,2)]
+  stderror_EFF <- result_EFF[c(3,4)]
+  cv_EFF1 <- (tau[1] >= htau_EFF[1] - 1.96*stderror_EFF[1]) & 
+    (tau[1] <= htau_EFF[1] + 1.96*stderror_EFF[1])
+  cv_EFF2 <- (tau[2] >= htau_EFF[2] - 1.96*stderror_EFF[2]) & 
+    (tau[2] <= htau_EFF[2] + 1.96*stderror_EFF[2])
+  cv_EFF <- c(cv_EFF1, cv_EFF2)
+  
+  ## GIM
+  result_GIM <- esti.GIM(x_inter, y_inter,tildabeta, V,n1)
+  htau_GIM <- result_GIM[c(1,2)]
+  stderror_GIM <- result_GIM[c(3,4)]
+  cv_GIM1 <- (tau[1] >= htau_GIM[1] - 1.96*stderror_GIM[1]) & 
+    (tau[1] <= htau_GIM[1] + 1.96*stderror_GIM[1])
+  cv_GIM2 <- (tau[2] >= htau_GIM[2] - 1.96*stderror_GIM[2]) & 
+    (tau[2] <= htau_GIM[2] + 1.96*stderror_GIM[2])
+  cv_GIM <- c(cv_GIM1, cv_GIM2)
+  
+  list(htau_INT=htau_INT, htau_ORC=htau_ORC, htau_ADF=htau_ADF, 
+       htau_EFF=htau_EFF, htau_GIM=htau_GIM,
+       length_INT=2*1.96*stderror_INT, length_ORC=2*1.96*stderror_ORC, length_ADF=2*1.96*stderror_ADF,
+       length_EFF=2*1.96*stderror_EFF, length_GIM=2*1.96*stderror_GIM, length_SADF=cri_boot[, 2] - cri_boot[, 1],
+       cv_INT=cv_INT, cv_ORC=cv_ORC, cv_ADF=cv_ADF, cv_SADF=cv_SADF, cv_EFF=cv_EFF, cv_GIM=cv_GIM)
+}
+
+
+
+nsims <- 1000
+ncpus <- 20
+n0 <- 500
+n1 <- 2000
+n <- n0 + n1
+kfold <- 3
+B <- 20 #this is the constant C in the maintext
+
+duration <- Sys.time()
+duration
+
+# set RNG seed for reproducibility 
+RNGkind("L'Ecuyer-CMRG")
+set.seed(777)
+
+simu <- t(parReplicate(nsims, expr=simuOne(n, n0, n1,kfold = kfold, B), 
+                       simplify=TRUE, mc.cores=ncpus, mc.set.seed=TRUE))
+
+htau_INT <- do.call(rbind, simu[, 'htau_INT'])
+htau_ORC <- do.call(rbind, simu[, 'htau_ORC'])
+htau_ADF <- do.call(rbind, simu[, 'htau_ADF'])
+htau_EFF <- do.call(rbind, simu[, 'htau_EFF'])
+htau_GIM <- do.call(rbind, simu[, 'htau_GIM'])
+
+length_INT <- do.call(rbind, simu[, 'length_INT'])
+length_ORC <- do.call(rbind, simu[, 'length_ORC'])
+length_ADF <- do.call(rbind, simu[, 'length_ADF'])
+length_SADF <- do.call(rbind, simu[, 'length_SADF'])
+length_EFF <- do.call(rbind, simu[, 'length_EFF'])
+length_GIM <- do.call(rbind, simu[, 'length_GIM'])
+
+cv_INT <- do.call(rbind, simu[, 'cv_INT'])
+cv_ORC <- do.call(rbind, simu[, 'cv_ORC'])
+cv_ADF <- do.call(rbind, simu[, 'cv_ADF'])
+cv_SADF <- do.call(rbind, simu[, 'cv_SADF'])
+cv_EFF <- do.call(rbind, simu[, 'cv_EFF'])
+cv_GIM <- do.call(rbind, simu[, 'cv_GIM'])
+
+CIl_INT <- apply(length_INT, 2, mean)
+CIl_ORC <- apply(length_ORC, 2, mean)
+CIl_ADF <- apply(length_ADF, 2, mean)
+CIl_SADF <- apply(length_SADF, 2, mean)
+CIl_EFF <- apply(length_EFF, 2, mean)
+CIl_GIM <- apply(length_GIM, 2, mean, na.rm=TRUE)
+
+cvp_INT <- apply(cv_INT, 2, mean)
+cvp_ORC <- apply(cv_ORC, 2, mean)
+cvp_ADF <- apply(cv_ADF, 2, mean)
+cvp_SADF <- apply(cv_SADF, 2, mean)
+cvp_EFF <- apply(cv_EFF, 2, mean)
+cvp_GIM <- apply(cv_GIM, 2, mean, na.rm=TRUE)
+
+
+duration <- Sys.time() - duration
+duration
+
+htau <- cbind(htau_INT, htau_ORC, htau_ADF, htau_EFF, htau_GIM)
+MSE <- colMeans(sweep(htau, 2, rep(1,10))^2, na.rm=TRUE)
+RMSE <- sqrt(MSE)
+
+# save results
+path.save <- paste0('Results')
+dir.create(path.save, recursive=TRUE)
+path.image <- paste0(path.save,'/n=',n0,'B=',B, 'Sam-cont', 'Simu4.RData')
+save.image(file=path.image)
+
+
+path.graph <- paste0(path.save,'/n=',n0,'B=',B, 'Sam-cont.pdf')
+pdf(file=path.graph, width=9, height=9)
+op <- par(mfcol=c(1, 1), mai=c(0.6,0.5,0.6,0.4), 
+          oma=c(2,2,2,2), cex=1)
+boxplot(htau[,c(1,3,5,7,9)], outline=FALSE, xaxt='n', lwd=2, cex.axis=2.5,
+        boxwex = 0.5)
+title(main=expression(tau[1]),cex.main=4, line=2)
+axis(1, at = 1:5, labels = c("INT", "ORC", "ADF", "EFF", "GIM"), line=1.5, tick=FALSE, cex.axis=2.5)
+abline(h=1)
+par(op)
+dev.off()
+
+path.graph <- paste0(path.save,'/n=',n0,'B=',B, 'Sam-cont.pdf')
+pdf(file=path.graph, width=9, height=9)
+op <- par(mfcol=c(1, 1), mai=c(0.6,0.5,0.6,0.4), 
+          oma=c(2,2,2,2), cex=1)
+boxplot(htau[,c(2,4,6,8,10)], outline=FALSE, xaxt='n', lwd=2, cex.axis=2.5,
+        boxwex = 0.5)
+title(main=expression(tau[2]),cex.main=4, line=2)
+axis(1, at = 1:5, labels = c("INT", "ORC", "ADF", "EFF", "GIM"), line=1.5, tick=FALSE, cex.axis=2.5)
+abline(h=1)
+par(op)
+dev.off()
+
+round(rbind(cbind(c(CIl_INT[1], CIl_ORC[1], CIl_ADF[1], CIl_EFF[1], CIl_GIM[1], CIl_SADF[1]), 
+            c(cvp_INT[1], cvp_ORC[1], cvp_ADF[1], cvp_EFF[1], cvp_GIM[1], cvp_SADF[1])),
+            cbind(c(CIl_INT[2], CIl_ORC[2], CIl_ADF[2], CIl_EFF[2], CIl_GIM[2], CIl_SADF[2]), 
+            c(cvp_INT[2], cvp_ORC[2], cvp_ADF[2], cvp_EFF[2], cvp_GIM[2], cvp_SADF[2]))) * 100, 2)
+
+out <- round(rbind(cbind(c(CIl_INT[1], CIl_ORC[1], CIl_ADF[1], CIl_EFF[1], CIl_GIM[1], CIl_SADF[1]), 
+                         c(cvp_INT[1], cvp_ORC[1], cvp_ADF[1], cvp_EFF[1], cvp_GIM[1], cvp_SADF[1])),
+                   cbind(c(CIl_INT[2], CIl_ORC[2], CIl_ADF[2], CIl_EFF[2], CIl_GIM[2], CIl_SADF[2]), 
+                         c(cvp_INT[2], cvp_ORC[2], cvp_ADF[2], cvp_EFF[2], cvp_GIM[2], cvp_SADF[2]))) * 100, 2)
+
+rownames(out) <- c()
+write.csv(out, file = paste("res.tmp_", B, ".csv", sep =""), row.names = F)
